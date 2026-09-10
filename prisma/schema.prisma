@@ -1,0 +1,234 @@
+// ============================================================================
+// A2 — Multi-Tenant SaaS Starter — Prisma Schema
+// ============================================================================
+// Design notes (put these in your skill file, section 3 & 4):
+//
+// - Every table that holds tenant-scoped data carries an `organizationId`
+//   column. This is the load-bearing decision of the whole project: it is
+//   what makes row-level isolation possible. NEVER add a tenant table
+//   without this column.
+// - `User` is intentionally NOT tenant-scoped — a person can belong to
+//   multiple organizations (agencies, consultants, etc). `Membership` is
+//   the join table that carries the role.
+// - Money-related fields (plan limits, invoice amounts) are stored as
+//   integers in the smallest currency unit (paise/cents) to avoid float
+//   rounding bugs — a classic "gave up" line for your skill file.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  passwordHash  String? // null if user only signs in via OAuth
+  emailVerified DateTime?
+  image         String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships  Membership[]
+  auditEntries AuditLog[]
+  sentInvites  Invite[]     @relation("InviteSentBy")
+
+  // NextAuth-required relations
+  accounts Account[]
+  sessions Session[]
+
+  @@map("users")
+}
+
+// NextAuth adapter tables (unchanged shape, required by @auth/prisma-adapter)
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy
+// ---------------------------------------------------------------------------
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+model Organization {
+  id   String @id @default(cuid())
+  name String
+  slug String @unique // used in URLs: app.com/org/{slug}
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships  Membership[]
+  invites      Invite[]
+  subscription Subscription?
+  usageRecords UsageRecord[]
+  auditLog     AuditLog[]
+
+  @@map("organizations")
+}
+
+// The join table between User and Organization. This is where RBAC lives.
+model Membership {
+  id             String @id @default(cuid())
+  userId         String
+  organizationId String
+  role           Role   @default(MEMBER)
+
+  createdAt DateTime @default(now())
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId]) // a user has exactly one role per org
+  @@index([organizationId])
+  @@map("memberships")
+}
+
+model Invite {
+  id             String   @id @default(cuid())
+  email          String
+  role           Role     @default(MEMBER)
+  token          String   @unique // signed, random — emailed as a link
+  organizationId String
+  invitedById    String
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+
+  createdAt DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  invitedBy    User         @relation("InviteSentBy", fields: [invitedById], references: [id])
+
+  @@index([organizationId])
+  @@map("invites")
+}
+
+// ---------------------------------------------------------------------------
+// Billing
+// ---------------------------------------------------------------------------
+
+enum PlanTier {
+  FREE
+  PRO
+  TEAM
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  TRIALING
+}
+
+model Subscription {
+  id             String             @id @default(cuid())
+  organizationId String             @unique
+  tier           PlanTier           @default(FREE)
+  status         SubscriptionStatus @default(ACTIVE)
+
+  // Payment gateway identifiers — never trust these alone, always confirm
+  // state changes via a verified webhook, never a client redirect.
+  gatewayCustomerId     String?
+  gatewaySubscriptionId String?
+
+  currentPeriodEnd DateTime?
+  cancelAtPeriodEnd Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@map("subscriptions")
+}
+
+// Records every webhook event we've processed, keyed by the gateway's own
+// event ID. This table is what makes webhook handling idempotent — before
+// processing an event, check if its ID is already here.
+model ProcessedWebhookEvent {
+  id          String   @id // the gateway's event id, e.g. evt_xxx
+  eventType   String
+  processedAt DateTime @default(now())
+
+  @@map("processed_webhook_events")
+}
+
+// ---------------------------------------------------------------------------
+// Usage metering
+// ---------------------------------------------------------------------------
+
+model UsageRecord {
+  id             String   @id @default(cuid())
+  organizationId String
+  metric         String // e.g. "api_calls", "seats", "storage_mb"
+  count          Int      @default(0)
+  periodStart    DateTime
+  periodEnd      DateTime
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, metric, periodStart])
+  @@index([organizationId])
+  @@map("usage_records")
+}
+
+// ---------------------------------------------------------------------------
+// Audit log
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String?
+  action         String // e.g. "member.invited", "role.changed", "plan.upgraded"
+  metadata       Json? // structured details, e.g. { targetUserId, oldRole, newRole }
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id])
+
+  @@index([organizationId, createdAt])
+  @@map("audit_logs")
+}
